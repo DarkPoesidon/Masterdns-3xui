@@ -7,7 +7,7 @@ Beginner-friendly installer and manager for running MasterDnsVPN and the origina
 Run this on a fresh Linux server as a sudo/root user:
 
 ```bash
-sudo bash <(curl -Ls https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/install.sh -o /tmp/masterdns-3xui-install.sh && sudo bash /tmp/masterdns-3xui-install.sh
 ```
 
 The installer will:

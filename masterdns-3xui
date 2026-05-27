@@ -472,7 +472,11 @@ install_or_update_all() {
   if [[ -f ./install.sh ]]; then
     bash ./install.sh
   else
-    bash <(curl -Ls https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/install.sh)
+    local tmp
+    tmp="$(mktemp)"
+    curl -fsSL https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/install.sh -o "$tmp"
+    bash "$tmp"
+    rm -f "$tmp"
   fi
 }
 

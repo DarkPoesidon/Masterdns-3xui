@@ -94,7 +94,11 @@ install_xui() {
   warn "The original 3x-ui installer will run now."
   warn "Keep SQLite unless you know you need PostgreSQL; automatic WARP setup uses SQLite."
   confirm "Install original 3x-ui panel now?" "Y" || return 0
-  bash <(curl -Ls "$XUI_INSTALL_URL")
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL "$XUI_INSTALL_URL" -o "$tmp"
+  bash "$tmp"
+  rm -f "$tmp"
 }
 
 install_masterdns() {
@@ -107,7 +111,11 @@ install_masterdns() {
   mkdir -p "$MASTERDNS_DIR"
   (
     cd "$MASTERDNS_DIR"
-    bash <(curl -Ls "$MASTERDNS_INSTALL_URL")
+    local tmp
+    tmp="$(mktemp)"
+    curl -fsSL "$MASTERDNS_INSTALL_URL" -o "$tmp"
+    bash "$tmp"
+    rm -f "$tmp"
   )
 }
 
@@ -143,4 +151,3 @@ main() {
 }
 
 main "$@"
-
