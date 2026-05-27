@@ -87,7 +87,13 @@ install_tools() {
 }
 
 has_systemd_service() {
-  systemctl list-unit-files 2>/dev/null | grep -q "^$1\\.service"
+  local unit="$1.service"
+  [[ -f "/etc/systemd/system/$unit" || -f "/lib/systemd/system/$unit" || -f "/usr/lib/systemd/system/$unit" ]] && return 0
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl cat "$1" >/dev/null 2>&1 && return 0
+  systemctl list-units --all --type=service 2>/dev/null | grep -q "^${unit}[[:space:]]" && return 0
+  systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${unit}[[:space:]]" && return 0
+  return 1
 }
 
 masterdns_installed() {
@@ -99,8 +105,22 @@ ensure_masterdns_config() {
 }
 
 systemctl_master() {
-  has_systemd_service "$MASTERDNS_SERVICE" || die "MasterDnsVPN service is not installed."
-  systemctl "$@" "$MASTERDNS_SERVICE"
+  local action="${1:-}"
+  [[ -n "$action" ]] || die "Missing service action."
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl "$action" "$MASTERDNS_SERVICE"; then
+      return 0
+    fi
+    if [[ "$action" == "restart" || "$action" == "start" || "$action" == "stop" || "$action" == "status" ]]; then
+      systemctl "$action" "$MASTERDNS_SERVICE.service"
+      return $?
+    fi
+  fi
+  if command -v service >/dev/null 2>&1 && [[ "$action" != "enable" && "$action" != "disable" ]]; then
+    service "$MASTERDNS_SERVICE" "$action"
+    return $?
+  fi
+  die "Could not run '$action' for MasterDnsVPN. Try: sudo systemctl $action $MASTERDNS_SERVICE"
 }
 
 restart_masterdns() {

@@ -102,7 +102,7 @@ install_xui() {
 }
 
 install_masterdns() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^masterdnsvpn\.service'; then
+  if [[ -f /etc/systemd/system/masterdnsvpn.service ]] || systemctl cat masterdnsvpn >/dev/null 2>&1; then
     ok "MasterDnsVPN is already installed."
     return 0
   fi
