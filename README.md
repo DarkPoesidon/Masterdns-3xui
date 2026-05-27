@@ -40,11 +40,12 @@ Use the original 3x-ui menu for certificate, domain, panel port, firewall, logs,
 23) SSH Port Forwarding Management
 ```
 
-The combined manager also has:
+The combined manager also has MasterDnsVPN service/config tools and optional WARP/SOCKS routing for MasterDnsVPN only:
 
 ```text
-2) Open original 3x-ui admin menu
-3) WARP Management
+2) MasterDnsVPN service
+3) MasterDnsVPN config, domain, key, backups
+4) WARP / SOCKS for MasterDnsVPN only
 ```
 
 ## WARP
@@ -60,29 +61,26 @@ sudo masterdns-3xui
 Then choose:
 
 ```text
-3) WARP Management
-1) Turn WARP ON for both MasterDNS and 3x-ui
+4) WARP / SOCKS for MasterDnsVPN only
+1) Enable MasterDnsVPN through Cloudflare WARP
 ```
 
 The manager will:
 
 - install and register the official Cloudflare WARP Linux client,
 - set WARP to local proxy mode on `127.0.0.1:40000`,
-- add a normal Xray `socks` outbound tagged `warp` for 3x-ui,
-- set MasterDnsVPN to use the same local WARP SOCKS proxy,
-- restart services,
+- set MasterDnsVPN to use that local WARP SOCKS proxy,
+- restart MasterDnsVPN,
 - let you test the public IP path.
 
-You can turn WARP off from the same menu.
+It does not enable WARP for 3x-ui. Use the original 3x-ui panel if you want 3x-ui routing changes.
 
-If Xray does not start after enabling WARP, update the manager and run the repair command:
+If you previously used an older version of this manager and Xray does not start, update the manager and clean the old generated 3x-ui WARP entries:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/masterdns-3xui -o /usr/local/bin/masterdns-3xui && chmod +x /usr/local/bin/masterdns-3xui
-sudo masterdns-3xui repair-xray
+sudo masterdns-3xui clean-xui-warp
 ```
-
-Then reopen the manager and try WARP again. The current strategy does not add an Xray WireGuard outbound, so a WARP problem should not break Xray startup.
 
 ## Ports
 

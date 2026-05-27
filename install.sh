@@ -135,13 +135,14 @@ Useful service commands:
   sudo systemctl status masterdnsvpn
   sudo journalctl -u masterdnsvpn -f
 
-WARP is optional. Open the manager and choose:
-  3) WARP Management
+WARP is optional and only applies to MasterDnsVPN from this manager.
+Open the manager and choose:
+  4) WARP / SOCKS for MasterDnsVPN only
 
-Do not type "3" in the Linux shell. First run:
+Do not type menu numbers in the Linux shell. First run:
   sudo masterdns-3xui
 
-Then choose option 3 inside that menu.
+Then choose the menu option inside that manager.
 EOF
 }
 
