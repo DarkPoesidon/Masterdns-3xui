@@ -66,10 +66,10 @@ Then choose:
 
 The manager will:
 
-- create or reuse a Cloudflare WARP account for 3x-ui,
-- add an Xray `wireguard` outbound tagged `warp`,
-- add a local-only SOCKS bridge on `127.0.0.1:40000` for MasterDnsVPN,
-- set MasterDnsVPN to use that SOCKS bridge,
+- install and register the official Cloudflare WARP Linux client,
+- set WARP to local proxy mode on `127.0.0.1:40000`,
+- add a normal Xray `socks` outbound tagged `warp` for 3x-ui,
+- set MasterDnsVPN to use the same local WARP SOCKS proxy,
 - restart services,
 - let you test the public IP path.
 
@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/ma
 sudo masterdns-3xui repair-xray
 ```
 
-Then reopen the manager and try WARP again.
+Then reopen the manager and try WARP again. The current strategy does not add an Xray WireGuard outbound, so a WARP problem should not break Xray startup.
 
 ## Ports
 

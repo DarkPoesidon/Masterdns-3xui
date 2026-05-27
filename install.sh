@@ -52,24 +52,24 @@ install_base_deps() {
   case "$pm" in
     apt)
       apt-get update
-      apt-get install -y curl wget ca-certificates jq sqlite3 wireguard-tools iproute2 lsof unzip tar openssl cron
+      apt-get install -y curl wget ca-certificates jq sqlite3 iproute2 lsof unzip tar openssl cron
       ;;
     dnf)
-      dnf -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl cronie
+      dnf -y install curl wget ca-certificates jq sqlite iproute lsof unzip tar openssl cronie
       ;;
     yum)
-      yum -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl cronie
+      yum -y install curl wget ca-certificates jq sqlite iproute lsof unzip tar openssl cronie
       ;;
     pacman)
-      pacman -Sy --noconfirm curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl cronie
+      pacman -Sy --noconfirm curl wget ca-certificates jq sqlite iproute2 lsof unzip tar openssl cronie
       ;;
     zypper)
       zypper refresh
-      zypper -q install -y curl wget ca-certificates jq sqlite3-tools wireguard-tools iproute2 lsof unzip tar openssl cron
+      zypper -q install -y curl wget ca-certificates jq sqlite3-tools iproute2 lsof unzip tar openssl cron
       ;;
     apk)
       apk update
-      apk add curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl dcron
+      apk add curl wget ca-certificates jq sqlite iproute2 lsof unzip tar openssl dcron
       ;;
   esac
   ok "Tools are ready."

@@ -7,10 +7,8 @@ BACKUP_DIR="$APP_DIR/backups"
 MASTERDNS_DIR="/opt/masterdnsvpn"
 XUI_DB="/etc/x-ui/x-ui.db"
 XUI_ENV_FILES=("/etc/default/x-ui" "/etc/sysconfig/x-ui" "/etc/conf.d/x-ui")
-WARP_SOCKS_TAG="masterdns-warp-socks"
-WARP_SOCKS_PORT="40000"
-WARP_API_BASE="https://api.cloudflareclient.com/v0a4005"
-WARP_CLIENT_VER="a-6.30-3596"
+WARP_OUTBOUND_TAG="warp"
+WARP_PROXY_PORT="40000"
 
 red=$'\033[0;31m'
 green=$'\033[0;32m'
@@ -57,18 +55,18 @@ install_tools() {
   case "$pm" in
     apt)
       apt-get update
-      apt-get install -y curl wget ca-certificates jq sqlite3 wireguard-tools iproute2 lsof unzip tar openssl
+      apt-get install -y curl wget ca-certificates jq sqlite3 iproute2 lsof unzip tar openssl
       ;;
-    dnf) dnf -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl ;;
-    yum) yum -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl ;;
-    pacman) pacman -Sy --noconfirm curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl ;;
+    dnf) dnf -y install curl wget ca-certificates jq sqlite iproute lsof unzip tar openssl ;;
+    yum) yum -y install curl wget ca-certificates jq sqlite iproute lsof unzip tar openssl ;;
+    pacman) pacman -Sy --noconfirm curl wget ca-certificates jq sqlite iproute2 lsof unzip tar openssl ;;
     zypper)
       zypper refresh
-      zypper -q install -y curl wget ca-certificates jq sqlite3-tools wireguard-tools iproute2 lsof unzip tar openssl
+      zypper -q install -y curl wget ca-certificates jq sqlite3-tools iproute2 lsof unzip tar openssl
       ;;
     apk)
       apk update
-      apk add curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl
+      apk add curl wget ca-certificates jq sqlite iproute2 lsof unzip tar openssl
       ;;
   esac
 }
@@ -178,135 +176,117 @@ restart_masterdns() {
   fi
 }
 
-warp_data_file() { echo "$APP_DIR/warp-data.json"; }
-warp_config_file() { echo "$APP_DIR/warp-config.json"; }
+warp_cli() {
+  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@"
+}
 
-ensure_warp_account() {
-  check_sqlite_mode
-  require_cmd jq
-  require_cmd curl
-  require_cmd wg
-
-  local existing
-  existing="$(sqlite_get_setting warp || true)"
-  if [[ -n "$existing" ]] && echo "$existing" | jq -e '.access_token and .device_id and .private_key' >/dev/null 2>&1; then
-    printf '%s' "$existing" > "$(warp_data_file)"
-    ok "Existing 3x-ui WARP account found."
+install_cloudflare_warp() {
+  if command -v warp-cli >/dev/null 2>&1; then
+    ok "Cloudflare WARP is already installed."
     return 0
   fi
 
-  confirm "Create a new Cloudflare WARP account automatically?" "Y" || die "WARP account is required."
-
-  local private public hostname body response data_file
-  private="$(wg genkey)"
-  public="$(printf '%s' "$private" | wg pubkey)"
-  hostname="$(hostname 2>/dev/null || echo x-ui)"
-  body="$(jq -nc --arg key "$public" --arg name "$hostname" '{key:$key,tos:(now|strftime("%Y-%m-%dT%H:%M:%S.000Z")),type:"PC",model:"x-ui",name:$name}')"
-  response="$(curl -fsSL -X POST "$WARP_API_BASE/reg" -H "CF-Client-Version: $WARP_CLIENT_VER" -H "Content-Type: application/json" --data "$body")"
-
-  data_file="$(warp_data_file)"
-  jq -n \
-    --arg token "$(echo "$response" | jq -r '.token')" \
-    --arg id "$(echo "$response" | jq -r '.id')" \
-    --arg license "$(echo "$response" | jq -r '.account.license')" \
-    --arg private "$private" \
-    '{access_token:$token,device_id:$id,license_key:$license,private_key:$private}' > "$data_file"
-  jq -e '.access_token != "" and .device_id != "" and .private_key != ""' "$data_file" >/dev/null
-  set_warp_setting_file "$data_file"
-  ok "WARP account created and stored for 3x-ui."
+  local pm codename
+  pm="$(detect_pm)"
+  case "$pm" in
+    apt)
+      apt-get update
+      apt-get install -y curl ca-certificates gpg lsb-release
+      codename="$(lsb_release -cs 2>/dev/null || true)"
+      if [[ -z "$codename" ]]; then
+        . /etc/os-release
+        codename="${VERSION_CODENAME:-}"
+      fi
+      [[ -n "$codename" ]] || die "Could not detect Debian/Ubuntu codename for Cloudflare WARP repository."
+      mkdir -p /usr/share/keyrings
+      curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+      echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" > /etc/apt/sources.list.d/cloudflare-client.list
+      apt-get update
+      apt-get install -y cloudflare-warp
+      ;;
+    dnf|yum)
+      rpm --import https://pkg.cloudflareclient.com/pubkey.gpg || true
+      curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo -o /etc/yum.repos.d/cloudflare-warp.repo
+      "$pm" -y install cloudflare-warp
+      ;;
+    *)
+      die "Automatic Cloudflare WARP package install supports apt, dnf, and yum servers. Install cloudflare-warp manually, then run this menu again."
+      ;;
+  esac
 }
 
-fetch_warp_config() {
-  ensure_warp_account
-  local data_file cfg_file token device_id
-  data_file="$(warp_data_file)"
-  cfg_file="$(warp_config_file)"
-  token="$(jq -r '.access_token' "$data_file")"
-  device_id="$(jq -r '.device_id' "$data_file")"
-  curl -fsSL "$WARP_API_BASE/reg/$device_id" -H "Authorization: Bearer $token" > "$cfg_file"
-  jq -e '.config.peers[0].public_key and .config.peers[0].endpoint.host' "$cfg_file" >/dev/null
-  ok "WARP device config refreshed."
+start_warp_service() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now warp-svc >/dev/null 2>&1 && return 0
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service warp-svc start >/dev/null 2>&1 && return 0
+  fi
+  warn "Could not start warp-svc automatically. If WARP test fails, run: sudo systemctl start warp-svc"
 }
 
-ensure_warp_outbound() {
+set_warp_proxy_mode() {
+  install_cloudflare_warp
+  start_warp_service
+
+  if ! warp_cli registration show >/dev/null 2>&1; then
+    warp_cli registration new || warp_cli register || true
+  fi
+
+  warp_cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
+  warp_cli mode proxy >/dev/null 2>&1 || warp_cli set-mode proxy >/dev/null 2>&1 || die "Could not set WARP proxy mode."
+  warp_cli connect >/dev/null 2>&1 || true
+
+  local i
+  for i in $(seq 1 20); do
+    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$WARP_PROXY_PORT "; then
+      ok "Cloudflare WARP local proxy is listening on 127.0.0.1:$WARP_PROXY_PORT."
+      return 0
+    fi
+    sleep 1
+  done
+  warn "Could not confirm WARP proxy port $WARP_PROXY_PORT. Continuing; use Test public IP to verify."
+}
+
+ensure_warp_socks_outbound() {
   check_sqlite_mode
-  fetch_warp_config
-  local tmp next data_file cfg_file
-  tmp="$(mktemp)"
-  next="$(mktemp)"
-  data_file="$(warp_data_file)"
-  cfg_file="$(warp_config_file)"
-  get_xray_config_file "$tmp"
-
-  jq \
-    --slurpfile data "$data_file" \
-    --slurpfile warp "$cfg_file" '
-      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")) + [{
-        tag: "warp",
-        protocol: "wireguard",
-        settings: {
-          mtu: 1420,
-          secretKey: $data[0].private_key,
-          address: ([($warp[0].config.interface.addresses.v4 // empty) + "/32", ($warp[0].config.interface.addresses.v6 // empty) + "/128"] | map(select(. != "/32" and . != "/128"))),
-          domainStrategy: "ForceIP",
-          workers: 2,
-          peers: [{
-            publicKey: $warp[0].config.peers[0].public_key,
-            allowedIPs: ["0.0.0.0/0", "::/0"],
-            endpoint: $warp[0].config.peers[0].endpoint.host,
-            keepAlive: 25
-          }],
-          noKernelTun: true
-        }
-      }]) |
-      .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "api" or (.inboundTag // []) != ["api"]))) |
-      .routing.rules = ([{type:"field", inboundTag:["api"], outboundTag:"api"}] + (.routing.rules // []))
-    ' "$tmp" > "$next"
-  save_xray_config_file "$next"
-  rm -f "$tmp" "$next"
-  ok "3x-ui WARP outbound is ready."
-}
-
-ensure_masterdns_socks_bridge() {
-  check_sqlite_mode
-  ensure_warp_outbound
+  set_warp_proxy_mode
   local tmp next
   tmp="$(mktemp)"
   next="$(mktemp)"
   get_xray_config_file "$tmp"
 
-  jq \
-    --arg tag "$WARP_SOCKS_TAG" \
-    --argjson port "$WARP_SOCKS_PORT" '
-      .inbounds = ((.inbounds // []) | map(select(.tag != $tag)) + [{
-        tag: $tag,
-        listen: "127.0.0.1",
-        port: $port,
-        protocol: "socks",
-        settings: {auth: "noauth", udp: false, ip: "127.0.0.1"},
-        sniffing: {enabled: true, destOverride: ["http", "tls"]}
-      }]) |
-      .routing.rules = ((.routing.rules // []) | map(select((.inboundTag // []) != [$tag]))) |
-      .routing.rules = ([{type:"field", inboundTag:["api"], outboundTag:"api"}, {type:"field", inboundTag:[$tag], outboundTag:"warp"}] + ((.routing.rules // []) | map(select(.outboundTag != "api" or (.inboundTag // []) != ["api"]))))
-    ' "$tmp" > "$next"
+  jq --arg tag "$WARP_OUTBOUND_TAG" --argjson port "$WARP_PROXY_PORT" '
+    .outbounds = ((.outbounds // []) | map(select(.tag != $tag)) + [{
+      tag: $tag,
+      protocol: "socks",
+      settings: {servers: [{address: "127.0.0.1", port: $port, users: []}]}
+    }]) |
+    .inbounds = ((.inbounds // []) | map(select(.tag != "masterdns-warp-socks"))) |
+    .routing.rules = ((.routing.rules // []) | map(select(
+      (.outboundTag != "api" or (.inboundTag // []) != ["api"])
+      and ((.inboundTag // []) != ["masterdns-warp-socks"])
+    ))) |
+    .routing.rules = ([{type:"field", inboundTag:["api"], outboundTag:"api"}] + (.routing.rules // []))
+  ' "$tmp" > "$next"
   save_xray_config_file "$next"
   rm -f "$tmp" "$next"
-  ok "Local Xray SOCKS bridge is ready at 127.0.0.1:$WARP_SOCKS_PORT."
+  ok "3x-ui Xray SOCKS outbound points to Cloudflare WARP proxy."
 }
 
 enable_xui_warp_all() {
-  ensure_warp_outbound
+  ensure_warp_socks_outbound
   local tmp next
   tmp="$(mktemp)"
   next="$(mktemp)"
   get_xray_config_file "$tmp"
-  jq '
-    .routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":"warp"}))) |
-    .routing.rules = ((.routing.rules // []) + [{type:"field", outboundTag:"warp"}])
+  jq --arg tag "$WARP_OUTBOUND_TAG" '
+    .routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":$tag}))) |
+    .routing.rules = ((.routing.rules // []) + [{type:"field", outboundTag:$tag}])
   ' "$tmp" > "$next"
   save_xray_config_file "$next"
   restart_xui
-  ok "3x-ui default outbound routing now uses WARP. You can still customize routing inside the original panel."
+  ok "3x-ui default outbound routing now uses Cloudflare WARP local SOCKS proxy."
 }
 
 disable_xui_warp_all() {
@@ -315,11 +295,11 @@ disable_xui_warp_all() {
   tmp="$(mktemp)"
   next="$(mktemp)"
   get_xray_config_file "$tmp"
-  jq '.routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":"warp"})))' "$tmp" > "$next"
+  jq --arg tag "$WARP_OUTBOUND_TAG" '.routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":$tag})))' "$tmp" > "$next"
   save_xray_config_file "$next"
   restart_xui
   rm -f "$tmp" "$next"
-  ok "3x-ui catch-all WARP routing disabled. The WARP outbound remains available in the panel."
+  ok "3x-ui catch-all WARP routing disabled. The local SOCKS outbound remains available in the panel."
 }
 
 remove_generated_warp_from_xray() {
@@ -329,17 +309,17 @@ remove_generated_warp_from_xray() {
   next="$(mktemp)"
   get_xray_config_file "$tmp"
   backup_file "$XUI_DB"
-  jq --arg bridge "$WARP_SOCKS_TAG" '
-    .outbounds = ((.outbounds // []) | map(select(.tag != "warp"))) |
-    .inbounds = ((.inbounds // []) | map(select(.tag != $bridge))) |
+  jq --arg tag "$WARP_OUTBOUND_TAG" '
+    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) |
+    .inbounds = ((.inbounds // []) | map(select(.tag != "masterdns-warp-socks"))) |
     .routing.rules = ((.routing.rules // []) | map(select(
-      .outboundTag != "warp"
-      and ((.inboundTag // []) != [$bridge])
+      .outboundTag != $tag
+      and ((.inboundTag // []) != ["masterdns-warp-socks"])
     )))
   ' "$tmp" > "$next"
   save_xray_config_file "$next"
   rm -f "$tmp" "$next"
-  ok "Generated WARP outbound, catch-all route, and MasterDnsVPN SOCKS bridge removed from Xray config."
+  ok "Generated WARP SOCKS outbound, catch-all route, and old MasterDnsVPN bridge removed from Xray config."
 }
 
 patch_masterdns_config() {
@@ -348,7 +328,7 @@ patch_masterdns_config() {
   backup_file "$config"
   set_or_append_toml "$config" "USE_EXTERNAL_SOCKS5" "true"
   set_or_append_toml "$config" "FORWARD_IP" '"127.0.0.1"'
-  set_or_append_toml "$config" "FORWARD_PORT" "$WARP_SOCKS_PORT"
+  set_or_append_toml "$config" "FORWARD_PORT" "$WARP_PROXY_PORT"
   set_or_append_toml "$config" "SOCKS5_AUTH" "false"
 }
 
@@ -372,11 +352,10 @@ unpatch_masterdns_config() {
 }
 
 enable_masterdns_warp() {
-  ensure_masterdns_socks_bridge
-  restart_xui
+  set_warp_proxy_mode
   patch_masterdns_config
   restart_masterdns
-  ok "MasterDnsVPN WARP routing is active through 127.0.0.1:$WARP_SOCKS_PORT."
+  ok "MasterDnsVPN WARP routing is active through Cloudflare WARP proxy at 127.0.0.1:$WARP_PROXY_PORT."
 }
 
 disable_masterdns_warp() {
@@ -390,7 +369,7 @@ remove_warp_bridge() {
   tmp="$(mktemp)"
   next="$(mktemp)"
   get_xray_config_file "$tmp"
-  jq --arg tag "$WARP_SOCKS_TAG" '
+  jq --arg tag "masterdns-warp-socks" '
     .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) |
     .routing.rules = ((.routing.rules // []) | map(select((.inboundTag // []) != [$tag])))
   ' "$tmp" > "$next"
@@ -430,24 +409,24 @@ warp_status() {
   echo "WARP status"
   echo "-----------"
   if [[ -f "$XUI_DB" ]]; then
-    local warp cfg
-    warp="$(sqlite_get_setting warp || true)"
-    if [[ -n "$warp" ]]; then
-      echo "3x-ui WARP account: present"
-    else
-      echo "3x-ui WARP account: missing"
-    fi
+    local cfg
     cfg="$(mktemp)"
     if get_xray_config_file "$cfg" >/dev/null 2>&1; then
-      jq -r --arg tag "$WARP_SOCKS_TAG" '
-        "Xray WARP outbound: " + (if any(.outbounds[]?; .tag == "warp") then "present" else "missing" end),
-        "MasterDNS SOCKS bridge: " + (if any(.inbounds[]?; .tag == $tag) then "present" else "missing" end),
-        "3x-ui catch-all WARP route: " + (if any(.routing.rules[]?; . == {"type":"field","outboundTag":"warp"}) then "enabled" else "disabled" end)
+      jq -r --arg tag "$WARP_OUTBOUND_TAG" '
+        "3x-ui WARP SOCKS outbound: " + (if any(.outbounds[]?; .tag == $tag and .protocol == "socks") then "present" else "missing" end),
+        "3x-ui catch-all WARP route: " + (if any(.routing.rules[]?; . == {"type":"field","outboundTag":$tag}) then "enabled" else "disabled" end)
       ' "$cfg"
     fi
     rm -f "${cfg:-}"
   else
     echo "3x-ui DB: missing"
+  fi
+
+  if command -v warp-cli >/dev/null 2>&1; then
+    echo "Cloudflare WARP client: installed"
+    warp-cli status 2>/dev/null || true
+  else
+    echo "Cloudflare WARP client: missing"
   fi
 
   if [[ -f "$MASTERDNS_DIR/server_config.toml" ]]; then
@@ -468,11 +447,11 @@ test_public_ip() {
   echo "Direct server IP:"
   curl -fsSL --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)=' || true
   echo ""
-  echo "Via local MasterDNS WARP SOCKS bridge:"
-  if curl --socks5-hostname "127.0.0.1:$WARP_SOCKS_PORT" -fsSL --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)='; then
-    ok "SOCKS bridge test finished."
+  echo "Via Cloudflare WARP local SOCKS proxy:"
+  if curl --socks5-hostname "127.0.0.1:$WARP_PROXY_PORT" -fsSL --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)='; then
+    ok "WARP proxy test finished."
   else
-    warn "SOCKS bridge test failed. Make sure WARP is active and x-ui was restarted."
+    warn "WARP proxy test failed. Make sure WARP is active."
   fi
 }
 
@@ -535,7 +514,7 @@ WARP Management
 6) Deactivate WARP for MasterDnsVPN only
 7) Show WARP status
 8) Test public IP / WARP path
-9) Remove MasterDnsVPN local SOCKS bridge
+9) Remove old MasterDnsVPN Xray bridge
 10) Repair Xray after failed WARP start
 0) Back
 EOF
@@ -545,11 +524,11 @@ EOF
       2) confirm "Turn WARP routing off for both services?" "Y" && disable_warp_both; pause ;;
       3) confirm "Route 3x-ui/Xray default outbound traffic through WARP?" "Y" && enable_xui_warp_all; pause ;;
       4) confirm "Disable 3x-ui/Xray catch-all WARP route?" "Y" && disable_xui_warp_all; pause ;;
-      5) confirm "Route MasterDnsVPN egress through local Xray WARP SOCKS?" "Y" && enable_masterdns_warp; pause ;;
+      5) confirm "Route MasterDnsVPN egress through Cloudflare WARP local SOCKS?" "Y" && enable_masterdns_warp; pause ;;
       6) confirm "Disable MasterDnsVPN external SOCKS5 WARP route?" "Y" && disable_masterdns_warp; pause ;;
       7) warp_status; pause ;;
       8) test_public_ip; pause ;;
-      9) confirm "Remove only the local SOCKS bridge from Xray config?" "Y" && remove_warp_bridge; pause ;;
+      9) confirm "Remove only the old local Xray SOCKS bridge?" "Y" && remove_warp_bridge; pause ;;
       10) confirm "Remove generated WARP config and restart x-ui/Xray?" "Y" && repair_xray_after_warp; pause ;;
       0) return ;;
       *) warn "Invalid choice"; pause ;;
