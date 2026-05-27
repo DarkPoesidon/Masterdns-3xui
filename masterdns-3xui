@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+APP_DIR="/opt/masterdns-3xui"
+BACKUP_DIR="$APP_DIR/backups"
+MASTERDNS_DIR="/opt/masterdnsvpn"
+XUI_DB="/etc/x-ui/x-ui.db"
+XUI_ENV_FILES=("/etc/default/x-ui" "/etc/sysconfig/x-ui" "/etc/conf.d/x-ui")
+WARP_SOCKS_TAG="masterdns-warp-socks"
+WARP_SOCKS_PORT="40000"
+WARP_API_BASE="https://api.cloudflareclient.com/v0a4005"
+WARP_CLIENT_VER="a-6.30-3596"
+
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+blue='\033[0;34m'
+plain='\033[0m'
+
+info() { echo -e "${blue}[INFO]${plain} $*"; }
+ok() { echo -e "${green}[OK]${plain} $*"; }
+warn() { echo -e "${yellow}[WARN]${plain} $*"; }
+err() { echo -e "${red}[ERROR]${plain} $*" >&2; }
+die() { err "$*"; exit 1; }
+
+need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo masterdns-3xui"; }
+pause() { read -r -p "Press Enter to continue... " _ || true; }
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  local default="${2:-Y}"
+  local ans
+  read -r -p "${prompt} [${default}/n]: " ans
+  ans="${ans:-$default}"
+  [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" || "$ans" == "YES" ]]
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1. Re-run install.sh to install dependencies."
+}
+
+detect_pm() {
+  if command -v apt-get >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  elif command -v yum >/dev/null 2>&1; then echo yum
+  elif command -v pacman >/dev/null 2>&1; then echo pacman
+  elif command -v zypper >/dev/null 2>&1; then echo zypper
+  elif command -v apk >/dev/null 2>&1; then echo apk
+  else die "No supported package manager found."
+  fi
+}
+
+install_tools() {
+  local pm
+  pm="$(detect_pm)"
+  case "$pm" in
+    apt)
+      apt-get update
+      apt-get install -y curl wget ca-certificates jq sqlite3 wireguard-tools iproute2 lsof unzip tar openssl
+      ;;
+    dnf) dnf -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl ;;
+    yum) yum -y install curl wget ca-certificates jq sqlite wireguard-tools iproute lsof unzip tar openssl ;;
+    pacman) pacman -Sy --noconfirm curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl ;;
+    zypper)
+      zypper refresh
+      zypper -q install -y curl wget ca-certificates jq sqlite3-tools wireguard-tools iproute2 lsof unzip tar openssl
+      ;;
+    apk)
+      apk update
+      apk add curl wget ca-certificates jq sqlite wireguard-tools iproute2 lsof unzip tar openssl
+      ;;
+  esac
+}
+
+ensure_dirs() {
+  mkdir -p "$APP_DIR" "$BACKUP_DIR"
+}
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+backup_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  cp -a "$file" "$BACKUP_DIR/$(basename "$file").$(timestamp).bak"
+}
+
+check_sqlite_mode() {
+  for f in "${XUI_ENV_FILES[@]}"; do
+    if [[ -f "$f" ]] && grep -q '^XUI_DB_TYPE=postgres' "$f"; then
+      die "Automatic WARP editing currently supports 3x-ui SQLite only. Use the original panel WARP menu for PostgreSQL installs."
+    fi
+  done
+  [[ -f "$XUI_DB" ]] || die "3x-ui SQLite DB not found at $XUI_DB. Install 3x-ui first."
+}
+
+sqlite_get_setting() {
+  local key="$1"
+  sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key = '$key' ORDER BY id DESC LIMIT 1;"
+}
+
+sqlite_set_setting_file() {
+  local key="$1"
+  local value_file="$2"
+  require_cmd sqlite3
+  require_cmd jq
+  local compact escaped
+  compact="$(jq -c . "$value_file")"
+  escaped="$(printf '%s' "$compact" | sed "s/'/''/g")"
+  sqlite3 "$XUI_DB" "UPDATE settings SET value = '$escaped' WHERE key = '$key';"
+  if [[ "$(sqlite3 "$XUI_DB" "SELECT changes();")" == "0" ]]; then
+    sqlite3 "$XUI_DB" "INSERT INTO settings(key, value) VALUES('$key', '$escaped');"
+  fi
+}
+
+default_xray_config() {
+  cat <<'JSON'
+{
+  "api": {"services": ["HandlerService", "LoggerService", "StatsService"], "tag": "api"},
+  "inbounds": [{"listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"rewriteAddress": "127.0.0.1"}, "tag": "api"}],
+  "log": {"access": "none", "dnsLog": false, "error": "", "loglevel": "warning", "maskAddress": ""},
+  "metrics": {"listen": "127.0.0.1:11111", "tag": "metrics_out"},
+  "outbounds": [
+    {"protocol": "freedom", "settings": {"domainStrategy": "AsIs", "finalRules": [{"action": "allow", "ip": ["geoip:private"]}]}, "tag": "direct"},
+    {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
+  ],
+  "policy": {"levels": {"0": {"statsUserDownlink": true, "statsUserUplink": true}}, "system": {"statsInboundDownlink": true, "statsInboundUplink": true, "statsOutboundDownlink": false, "statsOutboundUplink": false}},
+  "routing": {"domainStrategy": "AsIs", "rules": [
+    {"inboundTag": ["api"], "outboundTag": "api", "type": "field"},
+    {"ip": ["geoip:private"], "outboundTag": "blocked", "type": "field"},
+    {"outboundTag": "blocked", "protocol": ["bittorrent"], "type": "field"}
+  ]},
+  "stats": {}
+}
+JSON
+}
+
+get_xray_config_file() {
+  local out="$1"
+  local raw
+  raw="$(sqlite_get_setting xrayTemplateConfig || true)"
+  if [[ -z "$raw" ]]; then
+    default_xray_config > "$out"
+  else
+    printf '%s' "$raw" > "$out"
+  fi
+  jq empty "$out" >/dev/null
+}
+
+save_xray_config_file() {
+  local file="$1"
+  jq empty "$file" >/dev/null
+  backup_file "$XUI_DB"
+  sqlite_set_setting_file xrayTemplateConfig "$file"
+}
+
+set_warp_setting_file() {
+  local file="$1"
+  backup_file "$XUI_DB"
+  sqlite_set_setting_file warp "$file"
+}
+
+restart_xui() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
+    systemctl restart x-ui
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service x-ui restart
+  else
+    warn "Could not restart x-ui automatically. Run: sudo x-ui restart"
+  fi
+}
+
+restart_masterdns() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^masterdnsvpn\.service'; then
+    systemctl restart masterdnsvpn
+  else
+    warn "MasterDnsVPN service not found."
+  fi
+}
+
+warp_data_file() { echo "$APP_DIR/warp-data.json"; }
+warp_config_file() { echo "$APP_DIR/warp-config.json"; }
+
+ensure_warp_account() {
+  check_sqlite_mode
+  require_cmd jq
+  require_cmd curl
+  require_cmd wg
+
+  local existing
+  existing="$(sqlite_get_setting warp || true)"
+  if [[ -n "$existing" ]] && echo "$existing" | jq -e '.access_token and .device_id and .private_key' >/dev/null 2>&1; then
+    printf '%s' "$existing" > "$(warp_data_file)"
+    ok "Existing 3x-ui WARP account found."
+    return 0
+  fi
+
+  confirm "Create a new Cloudflare WARP account automatically?" "Y" || die "WARP account is required."
+
+  local private public hostname body response data_file
+  private="$(wg genkey)"
+  public="$(printf '%s' "$private" | wg pubkey)"
+  hostname="$(hostname 2>/dev/null || echo x-ui)"
+  body="$(jq -nc --arg key "$public" --arg name "$hostname" '{key:$key,tos:(now|strftime("%Y-%m-%dT%H:%M:%S.000Z")),type:"PC",model:"x-ui",name:$name}')"
+  response="$(curl -fsSL -X POST "$WARP_API_BASE/reg" -H "CF-Client-Version: $WARP_CLIENT_VER" -H "Content-Type: application/json" --data "$body")"
+
+  data_file="$(warp_data_file)"
+  jq -n \
+    --arg token "$(echo "$response" | jq -r '.token')" \
+    --arg id "$(echo "$response" | jq -r '.id')" \
+    --arg license "$(echo "$response" | jq -r '.account.license')" \
+    --arg private "$private" \
+    '{access_token:$token,device_id:$id,license_key:$license,private_key:$private}' > "$data_file"
+  jq -e '.access_token != "" and .device_id != "" and .private_key != ""' "$data_file" >/dev/null
+  set_warp_setting_file "$data_file"
+  ok "WARP account created and stored for 3x-ui."
+}
+
+fetch_warp_config() {
+  ensure_warp_account
+  local data_file cfg_file token device_id
+  data_file="$(warp_data_file)"
+  cfg_file="$(warp_config_file)"
+  token="$(jq -r '.access_token' "$data_file")"
+  device_id="$(jq -r '.device_id' "$data_file")"
+  curl -fsSL "$WARP_API_BASE/reg/$device_id" -H "Authorization: Bearer $token" > "$cfg_file"
+  jq -e '.config.peers[0].public_key and .config.peers[0].endpoint.host' "$cfg_file" >/dev/null
+  ok "WARP device config refreshed."
+}
+
+ensure_warp_outbound() {
+  check_sqlite_mode
+  fetch_warp_config
+  local tmp next data_file cfg_file
+  tmp="$(mktemp)"
+  next="$(mktemp)"
+  data_file="$(warp_data_file)"
+  cfg_file="$(warp_config_file)"
+  get_xray_config_file "$tmp"
+
+  jq \
+    --slurpfile data "$data_file" \
+    --slurpfile warp "$cfg_file" '
+      .outbounds = ((.outbounds // []) | map(select(.tag != "warp")) + [{
+        tag: "warp",
+        protocol: "wireguard",
+        settings: {
+          mtu: 1420,
+          secretKey: $data[0].private_key,
+          address: ([($warp[0].config.interface.addresses.v4 // empty) + "/32", ($warp[0].config.interface.addresses.v6 // empty) + "/128"] | map(select(. != "/32" and . != "/128"))),
+          domainStrategy: "ForceIP",
+          peers: [{publicKey: $warp[0].config.peers[0].public_key, endpoint: $warp[0].config.peers[0].endpoint.host}],
+          noKernelTun: false
+        }
+      }]) |
+      .routing.rules = ((.routing.rules // []) | map(select(.outboundTag != "api" or (.inboundTag // []) != ["api"]))) |
+      .routing.rules = ([{type:"field", inboundTag:["api"], outboundTag:"api"}] + (.routing.rules // []))
+    ' "$tmp" > "$next"
+  save_xray_config_file "$next"
+  rm -f "$tmp" "$next"
+  ok "3x-ui WARP outbound is ready."
+}
+
+ensure_masterdns_socks_bridge() {
+  check_sqlite_mode
+  ensure_warp_outbound
+  local tmp next
+  tmp="$(mktemp)"
+  next="$(mktemp)"
+  get_xray_config_file "$tmp"
+
+  jq \
+    --arg tag "$WARP_SOCKS_TAG" \
+    --argjson port "$WARP_SOCKS_PORT" '
+      .inbounds = ((.inbounds // []) | map(select(.tag != $tag)) + [{
+        tag: $tag,
+        listen: "127.0.0.1",
+        port: $port,
+        protocol: "socks",
+        settings: {auth: "noauth", udp: false, ip: "127.0.0.1"},
+        sniffing: {enabled: true, destOverride: ["http", "tls"]}
+      }]) |
+      .routing.rules = ((.routing.rules // []) | map(select((.inboundTag // []) != [$tag]))) |
+      .routing.rules = ([{type:"field", inboundTag:["api"], outboundTag:"api"}, {type:"field", inboundTag:[$tag], outboundTag:"warp"}] + ((.routing.rules // []) | map(select(.outboundTag != "api" or (.inboundTag // []) != ["api"]))))
+    ' "$tmp" > "$next"
+  save_xray_config_file "$next"
+  rm -f "$tmp" "$next"
+  ok "Local Xray SOCKS bridge is ready at 127.0.0.1:$WARP_SOCKS_PORT."
+}
+
+enable_xui_warp_all() {
+  ensure_warp_outbound
+  local tmp next
+  tmp="$(mktemp)"
+  next="$(mktemp)"
+  get_xray_config_file "$tmp"
+  jq '
+    .routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":"warp"}))) |
+    .routing.rules = ((.routing.rules // []) + [{type:"field", outboundTag:"warp"}])
+  ' "$tmp" > "$next"
+  save_xray_config_file "$next"
+  restart_xui
+  ok "3x-ui default outbound routing now uses WARP. You can still customize routing inside the original panel."
+}
+
+disable_xui_warp_all() {
+  check_sqlite_mode
+  local tmp next
+  tmp="$(mktemp)"
+  next="$(mktemp)"
+  get_xray_config_file "$tmp"
+  jq '.routing.rules = ((.routing.rules // []) | map(select(. != {"type":"field","outboundTag":"warp"})))' "$tmp" > "$next"
+  save_xray_config_file "$next"
+  restart_xui
+  rm -f "$tmp" "$next"
+  ok "3x-ui catch-all WARP routing disabled. The WARP outbound remains available in the panel."
+}
+
+patch_masterdns_config() {
+  local config="$MASTERDNS_DIR/server_config.toml"
+  [[ -f "$config" ]] || die "MasterDnsVPN config not found: $config"
+  backup_file "$config"
+  set_or_append_toml "$config" "USE_EXTERNAL_SOCKS5" "true"
+  set_or_append_toml "$config" "FORWARD_IP" '"127.0.0.1"'
+  set_or_append_toml "$config" "FORWARD_PORT" "$WARP_SOCKS_PORT"
+  set_or_append_toml "$config" "SOCKS5_AUTH" "false"
+}
+
+set_or_append_toml() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -qE "^${key}[[:space:]]*=" "$file"; then
+    sed -i -E "s|^${key}[[:space:]]*=.*$|${key} = ${value}|" "$file"
+  else
+    printf '\n%s = %s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+unpatch_masterdns_config() {
+  local config="$MASTERDNS_DIR/server_config.toml"
+  [[ -f "$config" ]] || die "MasterDnsVPN config not found: $config"
+  backup_file "$config"
+  set_or_append_toml "$config" "USE_EXTERNAL_SOCKS5" "false"
+  ok "MasterDnsVPN external SOCKS5 disabled. FORWARD_IP/FORWARD_PORT were left in place for easy reactivation."
+}
+
+enable_masterdns_warp() {
+  ensure_masterdns_socks_bridge
+  restart_xui
+  patch_masterdns_config
+  restart_masterdns
+  ok "MasterDnsVPN WARP routing is active through 127.0.0.1:$WARP_SOCKS_PORT."
+}
+
+disable_masterdns_warp() {
+  unpatch_masterdns_config
+  restart_masterdns
+}
+
+remove_warp_bridge() {
+  check_sqlite_mode
+  local tmp next
+  tmp="$(mktemp)"
+  next="$(mktemp)"
+  get_xray_config_file "$tmp"
+  jq --arg tag "$WARP_SOCKS_TAG" '
+    .inbounds = ((.inbounds // []) | map(select(.tag != $tag))) |
+    .routing.rules = ((.routing.rules // []) | map(select((.inboundTag // []) != [$tag])))
+  ' "$tmp" > "$next"
+  save_xray_config_file "$next"
+  rm -f "$tmp" "$next"
+  restart_xui
+  ok "Local MasterDnsVPN WARP bridge removed from Xray config."
+}
+
+enable_warp_both() {
+  enable_xui_warp_all
+  enable_masterdns_warp
+}
+
+disable_warp_both() {
+  disable_xui_warp_all
+  disable_masterdns_warp
+}
+
+warp_status() {
+  echo ""
+  echo "WARP status"
+  echo "-----------"
+  if [[ -f "$XUI_DB" ]]; then
+    local warp cfg
+    warp="$(sqlite_get_setting warp || true)"
+    if [[ -n "$warp" ]]; then
+      echo "3x-ui WARP account: present"
+    else
+      echo "3x-ui WARP account: missing"
+    fi
+    cfg="$(mktemp)"
+    if get_xray_config_file "$cfg" >/dev/null 2>&1; then
+      jq -r --arg tag "$WARP_SOCKS_TAG" '
+        "Xray WARP outbound: " + (if any(.outbounds[]?; .tag == "warp") then "present" else "missing" end),
+        "MasterDNS SOCKS bridge: " + (if any(.inbounds[]?; .tag == $tag) then "present" else "missing" end),
+        "3x-ui catch-all WARP route: " + (if any(.routing.rules[]?; . == {"type":"field","outboundTag":"warp"}) then "enabled" else "disabled" end)
+      ' "$cfg"
+    fi
+    rm -f "${cfg:-}"
+  else
+    echo "3x-ui DB: missing"
+  fi
+
+  if [[ -f "$MASTERDNS_DIR/server_config.toml" ]]; then
+    if grep -qE '^USE_EXTERNAL_SOCKS5[[:space:]]*=[[:space:]]*true' "$MASTERDNS_DIR/server_config.toml"; then
+      echo "MasterDnsVPN WARP via SOCKS: enabled"
+    else
+      echo "MasterDnsVPN WARP via SOCKS: disabled"
+    fi
+  else
+    echo "MasterDnsVPN config: missing"
+  fi
+  echo ""
+}
+
+test_public_ip() {
+  require_cmd curl
+  echo ""
+  echo "Direct server IP:"
+  curl -fsSL --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)=' || true
+  echo ""
+  echo "Via local MasterDNS WARP SOCKS bridge:"
+  if curl --socks5-hostname "127.0.0.1:$WARP_SOCKS_PORT" -fsSL --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)='; then
+    ok "SOCKS bridge test finished."
+  else
+    warn "SOCKS bridge test failed. Make sure WARP is active and x-ui was restarted."
+  fi
+}
+
+open_xui_menu() {
+  if command -v x-ui >/dev/null 2>&1; then
+    x-ui
+  else
+    die "x-ui command not found. Install 3x-ui first."
+  fi
+}
+
+service_status() {
+  echo ""
+  systemctl status x-ui --no-pager -l 2>/dev/null || true
+  echo ""
+  systemctl status masterdnsvpn --no-pager -l 2>/dev/null || true
+}
+
+show_info() {
+  echo ""
+  echo "3x-ui admin menu:"
+  echo "  sudo x-ui"
+  echo ""
+  echo "Combined manager:"
+  echo "  sudo masterdns-3xui"
+  echo ""
+  echo "MasterDnsVPN files:"
+  echo "  $MASTERDNS_DIR/server_config.toml"
+  echo "  $MASTERDNS_DIR/encrypt_key.txt"
+  echo ""
+  echo "Logs:"
+  echo "  sudo journalctl -u x-ui -f"
+  echo "  sudo journalctl -u masterdnsvpn -f"
+  echo ""
+}
+
+install_or_update_all() {
+  if [[ -f ./install.sh ]]; then
+    bash ./install.sh
+  else
+    bash <(curl -Ls https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/install.sh)
+  fi
+}
+
+warp_menu() {
+  while true; do
+    clear || true
+    cat <<EOF
+WARP Management
+---------------
+1) Turn WARP ON for both MasterDNS and 3x-ui
+2) Turn WARP OFF for both
+3) Activate WARP for 3x-ui only
+4) Deactivate WARP for 3x-ui only
+5) Activate WARP for MasterDnsVPN only
+6) Deactivate WARP for MasterDnsVPN only
+7) Show WARP status
+8) Test public IP / WARP path
+9) Remove MasterDnsVPN local SOCKS bridge
+0) Back
+EOF
+    read -r -p "Choose: " choice
+    case "$choice" in
+      1) confirm "Route both services through WARP where supported?" "Y" && enable_warp_both; pause ;;
+      2) confirm "Turn WARP routing off for both services?" "Y" && disable_warp_both; pause ;;
+      3) confirm "Route 3x-ui/Xray default outbound traffic through WARP?" "Y" && enable_xui_warp_all; pause ;;
+      4) confirm "Disable 3x-ui/Xray catch-all WARP route?" "Y" && disable_xui_warp_all; pause ;;
+      5) confirm "Route MasterDnsVPN egress through local Xray WARP SOCKS?" "Y" && enable_masterdns_warp; pause ;;
+      6) confirm "Disable MasterDnsVPN external SOCKS5 WARP route?" "Y" && disable_masterdns_warp; pause ;;
+      7) warp_status; pause ;;
+      8) test_public_ip; pause ;;
+      9) confirm "Remove only the local SOCKS bridge from Xray config?" "Y" && remove_warp_bridge; pause ;;
+      0) return ;;
+      *) warn "Invalid choice"; pause ;;
+    esac
+  done
+}
+
+main_menu() {
+  while true; do
+    clear || true
+    cat <<EOF
+MasterDNS + 3x-ui Manager
+-------------------------
+1) Install / update MasterDNS + original 3x-ui
+2) Open original 3x-ui admin menu
+3) WARP Management
+4) Show service status
+5) Show important info
+6) Restart both services
+0) Exit
+EOF
+    read -r -p "Choose: " choice
+    case "$choice" in
+      1) install_or_update_all; pause ;;
+      2) open_xui_menu; pause ;;
+      3) warp_menu ;;
+      4) service_status; pause ;;
+      5) show_info; pause ;;
+      6) restart_xui; restart_masterdns; pause ;;
+      0) exit 0 ;;
+      *) warn "Invalid choice"; pause ;;
+    esac
+  done
+}
+
+main() {
+  need_root
+  ensure_dirs
+  case "${1:-}" in
+    install-tools) install_tools ;;
+    warp-on) enable_warp_both ;;
+    warp-off) disable_warp_both ;;
+    warp-status) warp_status ;;
+    test-ip) test_public_ip ;;
+    x-ui) open_xui_menu ;;
+    *) main_menu ;;
+  esac
+}
+
+main "$@"

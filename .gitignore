@@ -1,0 +1,10 @@
+3x-ui-main/
+MasterDnsVPN-main/
+
+*.tmp
+*.log
+*.bak
+*.backup
+*.zip
+*.tar.gz
+
