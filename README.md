@@ -23,6 +23,8 @@ After it finishes, open the combined menu:
 sudo masterdns-3xui
 ```
 
+Do not type menu numbers like `3` directly in the Linux shell. First open the manager with `sudo masterdns-3xui`, then choose the menu number inside the manager.
+
 For certificate, domain, panel, firewall, and other 3x-ui settings, open the original 3x-ui admin menu:
 
 ```bash

@@ -12,11 +12,11 @@ WARP_SOCKS_PORT="40000"
 WARP_API_BASE="https://api.cloudflareclient.com/v0a4005"
 WARP_CLIENT_VER="a-6.30-3596"
 
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;34m'
-plain='\033[0m'
+red=$'\033[0;31m'
+green=$'\033[0;32m'
+yellow=$'\033[0;33m'
+blue=$'\033[0;34m'
+plain=$'\033[0m'
 
 info() { echo -e "${blue}[INFO]${plain} $*"; }
 ok() { echo -e "${green}[OK]${plain} $*"; }

@@ -10,11 +10,11 @@ MANAGER_URL="https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/
 MASTERDNS_INSTALL_URL="https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh"
 XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh"
 
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;34m'
-plain='\033[0m'
+red=$'\033[0;31m'
+green=$'\033[0;32m'
+yellow=$'\033[0;33m'
+blue=$'\033[0;34m'
+plain=$'\033[0m'
 
 info() { echo -e "${blue}[INFO]${plain} $*"; }
 ok() { echo -e "${green}[OK]${plain} $*"; }
@@ -137,7 +137,18 @@ Useful service commands:
 
 WARP is optional. Open the manager and choose:
   3) WARP Management
+
+Do not type "3" in the Linux shell. First run:
+  sudo masterdns-3xui
+
+Then choose option 3 inside that menu.
 EOF
+}
+
+open_manager_now() {
+  if [[ -x "$MANAGER_PATH" ]] && confirm "Open the combined manager now?" "Y"; then
+    "$MANAGER_PATH"
+  fi
 }
 
 main() {
@@ -148,6 +159,7 @@ main() {
   install_xui
   install_masterdns
   show_finish
+  open_manager_now
 }
 
 main "$@"
