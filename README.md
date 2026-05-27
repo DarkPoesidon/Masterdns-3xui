@@ -75,6 +75,15 @@ The manager will:
 
 You can turn WARP off from the same menu.
 
+If Xray does not start after enabling WARP, update the manager and run the repair command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DarkPoesidon/Masterdns-3xui/main/masterdns-3xui -o /usr/local/bin/masterdns-3xui && chmod +x /usr/local/bin/masterdns-3xui
+sudo masterdns-3xui repair-xray
+```
+
+Then reopen the manager and try WARP again.
+
 ## Ports
 
 MasterDnsVPN uses:
